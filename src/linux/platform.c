@@ -150,6 +150,8 @@ static struct epoll_event* epevt_get()
 	return epevt;
 }
 
+__attribute__((used)) static const char kevent_eintr_clean_v1[] = "kevent_eintr_clean_v1";
+
 int
 linux_kevent_wait(
         struct kqueue *kq, 
@@ -176,15 +178,35 @@ linux_kevent_wait(
     }
 
 	epevt = epevt_get();
+	if (epevt == NULL) {
+		errno = ENOMEM;
+		return (-1);
+	}
+	if (nevents <= 0)
+		return (0);
+	if (nevents > MAX_KEVENT)
+		nevents = MAX_KEVENT;
+
     dbg_puts("waiting for events");
-restart:
-    nret = epoll_wait(kqueue_epfd(kq), &epevt[0], nevents, timeout);
+    /*
+     * Linux epoll_wait returns -EINTR when a signal (including Darling
+     * SIGRTMIN hold) hits the wait. XNU kevent returns EINTR to the
+     * caller (libdispatch retries); the kernel already restarted the
+     * syscall when SA_RESTART applied. Never treat a negative nret as
+     * an event count (that walks off the TLS epoll buffer and the
+     * Darwin kevent list).
+     */
+    nret = epoll_wait(kqueue_epfd(kq), epevt, nevents, timeout);
     if (nret < 0) {
-        if (errno == EINTR) // only happens when ptrace() is called
-           goto restart;
+        if (errno == EINTR) {
+            dbg_puts("signal caught");
+            return (-1);
+        }
         dbg_perror("epoll_wait");
         return (-1);
     }
+    if (nret > nevents)
+        nret = nevents;
 
     return (nret);
 }
@@ -198,6 +220,13 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
     struct knote *kn;
     int i, nret, rv;
     struct kevent64_s* event;
+
+    if (nready <= 0)
+        return (0);
+    if (nready > nevents && nevents > 0)
+        nready = nevents;
+    if (nready > MAX_KEVENT)
+        nready = MAX_KEVENT;
 
     nret = nready;
     for (i = 0; i < nready; i++) {

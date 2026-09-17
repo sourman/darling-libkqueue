@@ -122,8 +122,19 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
     struct filter *filt;
     int rv = 0;
 
-    if (filter_lookup(&filt, kq, src->filter) < 0) 
+    if (src->filter == EVFILT_MACHPORT) {
+        fprintf(stderr, "kevent MACHPORT ident=%llu flags=0x%x fflags=0x%x\n",
+            (unsigned long long)src->ident, src->flags, src->fflags);
+        fflush(stderr);
+    }
+
+    if (filter_lookup(&filt, kq, src->filter) < 0) {
+        if (src->filter == EVFILT_MACHPORT) {
+            fprintf(stderr, "kevent MACHPORT filter_lookup failed errno=%d\n", errno);
+            fflush(stderr);
+        }
         return (-1);
+    }
 
     dbg_printf("src=%s", kevent_dump(src));
 
@@ -147,7 +158,16 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
             // but at the moment it just confuses clients
             kn->kev.flags &= ~EV_VANISHED;
 
+            if (src->filter == EVFILT_MACHPORT) {
+                fprintf(stderr, "kevent MACHPORT calling kn_create ident=%llu\n",
+                    (unsigned long long)src->ident);
+                fflush(stderr);
+            }
             if (filt->kn_create(filt, kn) < 0) {
+                if (src->filter == EVFILT_MACHPORT) {
+                    fprintf(stderr, "kevent MACHPORT kn_create failed errno=%d\n", errno);
+                    fflush(stderr);
+                }
                 knote_release(kn);
                 errno = EBADF;
                 return (-1);
@@ -336,6 +356,19 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
     (void) myid;
 #endif
 
+    if (nchanges > 0 && changelist) {
+        int i;
+        for (i = 0; i < nchanges && i < 8; i++) {
+            if (changelist[i].filter == EVFILT_MACHPORT ||
+                changelist[i].filter == EVFILT_TIMER) {
+                fprintf(stderr, "kevent64 filt=%d ident=%llu flags=0x%x nchanges=%d\n",
+                    changelist[i].filter, (unsigned long long)changelist[i].ident,
+                    changelist[i].flags, nchanges);
+            }
+        }
+        fflush(stderr);
+    }
+
     pthread_mutex_lock(&kq_mtx);
 
     /* Convert the descriptor into an object pointer */
@@ -388,6 +421,15 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
 again:
         rv = kqops.kevent_wait(kq, nevents, ts);
         dbg_printf("kqops.kevent_wait returned %d", rv);
+
+        if (rv < 0) {
+            int wait_err = errno;
+            kqueue_lock(kq);
+            kqueue_cleanup(kq);
+            kqueue_unlock(kq);
+            errno = wait_err ? wait_err : EINTR;
+            goto out;
+        }
 
         kqueue_lock(kq);
         if (fastpath(rv > 0)) {

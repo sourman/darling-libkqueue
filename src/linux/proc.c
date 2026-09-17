@@ -193,9 +193,11 @@ evfilt_proc_knote_create(struct filter *filt, struct knote *kn)
 	}
 	else
 	{
+		kn->kdata.kn_dupfd = -1;
 		int ret = _dserver_rpc_kqchan_proc_open_4libkqueue(kn->kev.ident, kn->kev.fflags, &kn->kdata.kn_dupfd);
-		if (ret < 0) {
-			dbg_printf("evproc_create() failed: %d (%s)\n", ret, strerror(-ret));
+		if (ret < 0 || kn->kdata.kn_dupfd < 0) {
+			dbg_printf("evproc_create() failed: %d (%s)\n", ret, strerror(ret < 0 ? -ret : EBADF));
+			kn->kdata.kn_dupfd = -1;
 			return -1;
 		}
 

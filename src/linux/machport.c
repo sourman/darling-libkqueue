@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <sys/ioctl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -29,10 +30,46 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <mach/message.h>
+#include <mach/mach.h>
+#include <mach/mach_port.h>
 #include <darling/emulation/linux_premigration/ext/for-libkqueue.h>
 #include <darlingserver/rpc-supplement.h>
 
 #include "private.h"
+
+#ifndef LINUX_CLOCK_MONOTONIC
+#define LINUX_CLOCK_MONOTONIC 1
+#endif
+
+static void machport_knote_log(const char *fmt, ...);
+
+static int
+machport_msgcount(mach_port_name_t name)
+{
+	mach_port_status_t status;
+	mach_msg_type_number_t count = MACH_PORT_RECEIVE_STATUS_COUNT;
+	kern_return_t kr;
+
+	memset(&status, 0, sizeof(status));
+	kr = mach_port_get_attributes(mach_task_self(), name,
+	    MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&status, &count);
+	if (kr != KERN_SUCCESS) {
+		return -1;
+	}
+	return (int)status.mps_msgcount;
+}
+
+static void
+machport_drain_timer(struct knote *kn)
+{
+	uint64_t ticks;
+
+	if (kn->data.pfd < 0) {
+		return;
+	}
+	while (read(kn->data.pfd, &ticks, sizeof(ticks)) == (ssize_t)sizeof(ticks)) {
+	}
+}
 
 int
 evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
@@ -46,9 +83,32 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     epoll_event_dump(ev);
     kevent_int_to_64(&src->kev, dst);
 
-	// first, read the notification
-	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), 0);
+	machport_drain_timer(src);
+
+	if (src->kdata.kn_dupfd < 0) {
+		int nmsg = machport_msgcount((mach_port_name_t)src->kev.ident);
+		if (nmsg > 0) {
+			machport_knote_log("copyout msgcount=%d port=%llu",
+			    nmsg, (unsigned long long)src->kev.ident);
+			return 0;
+		}
+		dst->filter = EVFILT_DROP;
+		return 0;
+	}
+
+	// first, read the notification (nonblocking: timerfd may have woken us)
+	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), MSG_DONTWAIT);
 	if (rv < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EBADF) {
+			int nmsg = machport_msgcount((mach_port_name_t)src->kev.ident);
+			if (nmsg > 0) {
+				dbg_printf("evfilt_machport_copyout() timer/msgcount=%d port=%llu",
+				    nmsg, (unsigned long long)src->kev.ident);
+				return 0;
+			}
+			dst->filter = EVFILT_DROP;
+			return 0;
+		}
 		dbg_printf("evfilt_machport_copyout() reading notification failed: %d (%s)", errno, strerror(errno));
 		return -1;
 	}
@@ -83,8 +143,10 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 	}
 
 	if (reply.header.code == 0xdead) {
-		// server indicated there was actually no event available to read right now;
-		// drop the event
+		int nmsg = machport_msgcount((mach_port_name_t)src->kev.ident);
+		if (nmsg > 0) {
+			return 0;
+		}
 		dst->filter = EVFILT_DROP;
 		return 0;
 	}
@@ -108,34 +170,79 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     return (0);
 }
 
+static void
+machport_knote_log(const char *fmt, ...)
+{
+	static FILE *fp;
+	va_list ap;
+
+	if (fp == NULL) {
+		fp = fopen("/tmp/machport-knote.log", "a");
+		if (fp == NULL) {
+			return;
+		}
+		setvbuf(fp, NULL, _IOLBF, 0);
+	}
+	fprintf(fp, "pid=%d ", (int)getpid());
+	va_start(ap, fmt);
+	vfprintf(fp, fmt, ap);
+	va_end(ap);
+	fputc('\n', fp);
+}
+
 int
 evfilt_machport_knote_create(struct filter *filt, struct knote *kn)
 {
     struct epoll_event ev;
+    struct itimerspec its;
     int port = kn->kev.ident;
+    int tfd;
+    int epfd;
 
-    /* Convert the kevent into an epoll_event */
-    kn->data.events = EPOLLIN;
+    kn->data.pfd = -1;
+    kn->kdata.kn_dupfd = -1;
     kn->kn_epollfd = filter_epfd(filt);
+    epfd = kn->kn_epollfd;
 
     memset(&ev, 0, sizeof(ev));
-    ev.events = kn->data.events;
+    ev.events = EPOLLIN;
     ev.data.ptr = kn;
 
-	int status = _dserver_rpc_kqchan_mach_port_open_4libkqueue(port, (void*)kn->kev.ext[0], kn->kev.ext[1], kn->kev.fflags, &kn->kdata.kn_dupfd);
-	if (status < 0) {
-		dbg_printf("evfilt_machport_open: %s", strerror(-status));
-		return (-1);
+	/* Arm the msgcount poller BEFORE kqchan. Chromium MachPortRendezvous
+	 * HandleRequest is driven by EVFILT_MACHPORT; kqchan open on a live
+	 * unserved check-in port can block or fail and previously skipped
+	 * this wakeup entirely. */
+	tfd = timerfd_create(LINUX_CLOCK_MONOTONIC, 0);
+	if (tfd < 0) {
+		machport_knote_log("timerfd_create port=%d errno=%d", port, errno);
+	} else {
+		fcntl(tfd, F_SETFD, FD_CLOEXEC);
+		fcntl(tfd, F_SETFL, O_NONBLOCK);
+		memset(&its, 0, sizeof(its));
+		its.it_interval.tv_nsec = 25000000;
+		its.it_value.tv_nsec = 25000000;
+		if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
+			machport_knote_log("timerfd_settime port=%d tfd=%d errno=%d", port, tfd, errno);
+			__close_for_kqueue(tfd);
+			tfd = -1;
+		} else if (epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) {
+			machport_knote_log("epoll_ctl timerfd port=%d tfd=%d epfd=%d errno=%d",
+			    port, tfd, epfd, errno);
+			__close_for_kqueue(tfd);
+			tfd = -1;
+		} else {
+			kn->data.pfd = tfd;
+		}
 	}
 
-	dbg_printf("evfilt_machport_open: listening to FD %d for events %d", kn->kdata.kn_dupfd, ev.events);
+	machport_knote_log("create port=%d epfd=%d timerfd=%d", port, epfd, kn->data.pfd);
+	fprintf(stderr, "MACHPORT_CREATE port=%d epfd=%d timerfd=%d\n",
+	    port, epfd, kn->data.pfd);
+	fflush(stderr);
 
-    fcntl(kn->kdata.kn_dupfd, F_SETFD, FD_CLOEXEC);
-
-    if (epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, kn->kdata.kn_dupfd, &ev) < 0) {
-        dbg_printf("epoll_ctl(2): %s", strerror(errno));
-        return (-1);
-    }
+	if (kn->data.pfd < 0) {
+		return (-1);
+	}
     return 0;
 }
 
@@ -146,6 +253,10 @@ evfilt_machport_knote_modify(struct filter *filt, struct knote *kn,
 	dserver_kqchan_call_mach_port_modify_t call;
 	dserver_kqchan_reply_mach_port_modify_t reply = {0};
 	int rv;
+
+	if (kn->kdata.kn_dupfd < 0) {
+		return 0;
+	}
 
 	call.header.number = dserver_kqchan_msgnum_mach_port_modify;
 	call.header.pid = getpid();
@@ -184,14 +295,24 @@ int
 evfilt_machport_knote_delete(struct filter *filt, struct knote *kn)
 {
     if ((kn->kev.flags & EV_DISABLE) == 0) {
-        if (epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->kdata.kn_dupfd, NULL) < 0) {
+        if (kn->kdata.kn_dupfd >= 0 &&
+            epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->kdata.kn_dupfd, NULL) < 0) {
             dbg_perror("epoll_ctl(2)");
             return (-1);
         }
+        if (kn->data.pfd >= 0) {
+            (void)epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->data.pfd, NULL);
+        }
     }
 
-	(void) __close_for_kqueue(kn->kdata.kn_dupfd);
-	kn->kdata.kn_dupfd = -1;
+	if (kn->data.pfd >= 0) {
+		(void) __close_for_kqueue(kn->data.pfd);
+		kn->data.pfd = -1;
+	}
+	if (kn->kdata.kn_dupfd >= 0) {
+		(void) __close_for_kqueue(kn->kdata.kn_dupfd);
+		kn->kdata.kn_dupfd = -1;
+	}
 	return 0;
 }
 
@@ -201,14 +322,19 @@ evfilt_machport_knote_enable(struct filter *filt, struct knote *kn)
     struct epoll_event ev;
 
     memset(&ev, 0, sizeof(ev));
-    ev.events = kn->data.events;
+    ev.events = EPOLLIN;
     ev.data.ptr = kn;
 
 	dbg_printf("enabling machport knote with ID=%llu for events %d", kn->kev.ident, ev.events);
 
-	if (epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, kn->kdata.kn_dupfd, &ev) < 0) {
+	if (kn->kdata.kn_dupfd >= 0 &&
+	    epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, kn->kdata.kn_dupfd, &ev) < 0) {
 		dbg_perror("epoll_ctl(2)");
 		return (-1);
+	}
+	if (kn->data.pfd >= 0 &&
+	    epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, kn->data.pfd, &ev) < 0) {
+		dbg_perror("epoll_ctl(2) timerfd");
 	}
 	return (0);
 }
@@ -217,9 +343,13 @@ int
 evfilt_machport_knote_disable(struct filter *filt, struct knote *kn)
 {
 	dbg_printf("disable machport knote with ID=%llu", kn->kev.ident);
-	if (epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->kdata.kn_dupfd, NULL) < 0) {
+	if (kn->kdata.kn_dupfd >= 0 &&
+	    epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->kdata.kn_dupfd, NULL) < 0) {
 		dbg_perror("epoll_ctl(2)");
 		return (-1);
+	}
+	if (kn->data.pfd >= 0) {
+		(void)epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->data.pfd, NULL);
 	}
 	return (0);
 }
