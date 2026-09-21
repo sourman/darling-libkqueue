@@ -76,6 +76,9 @@ struct eventfd {
 #define KNFL_REGULAR_FILE    (0x02)  /* File descriptor is a regular file */
 #define KNFL_DEFER_DELETE    (0x04)  /* Defer deletion until re-enabled */
 #define KNFL_KNOTE_DELETED   (0x10)  /* The knote object is no longer valid */
+#define KNFL_KQCHAN_NEED_REPLY (0x20) /* notify-only: mach_port_read in flight */
+#define KNFL_MACHPORT_DELIVERED (0x40) /* knote already delivered one MACHPORT event */
+#define KNFL_MACHPORT_HS_DRAIN (0x80) /* network Connect+Bind same-wakeup drain */
 
 #define EVFILT_DROP 0
 #define EVFILT_DROP_POSTPROCESS (EVFILT_SYSCOUNT + 1)

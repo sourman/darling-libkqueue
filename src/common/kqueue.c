@@ -39,6 +39,23 @@ pthread_mutex_t kq_mtx = PTHREAD_MUTEX_INITIALIZER;
 pthread_once_t kq_is_initialized = PTHREAD_ONCE_INIT;
 #endif
 
+#ifdef DARLING
+__attribute__((used)) const char kqueue_mtx_recursive_v1[] =
+        "kqueue_mtx_recursive_v1 send-during-recv";
+
+static void __attribute__((unused))
+kqueue_mtx_init_recursive(tracing_mutex_t *mtx)
+{
+	pthread_mutexattr_t attr;
+
+	(void)kqueue_mtx_recursive_v1;
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	tracing_mutex_init(mtx, &attr);
+	pthread_mutexattr_destroy(&attr);
+}
+#endif
+
 static unsigned int
 get_fd_limit(void)
 {
@@ -204,11 +221,21 @@ static void kqueue_close_ref_cb(int kqfd, void* kqptr, void* private) {
 // this function is too expensive for how often it can be called (which is every time an FD is closed).
 // if possible, this should be optimized or, better yet, we should just completely refactor libkqueue so that
 // some of the things this function needs to do are no longer necessary (like walking through every single kqueue).
+__attribute__((used)) const char kqueue_closed_fd_trylock_v1[] =
+        "kqueue_closed_fd_trylock_v1";
+
 void VISIBLE
 kqueue_closed_fd(int fd)
 {
+	static int logs;
+
 	if (kqmap == NULL)
 		return;
+
+	/* close() on CrBrowserMain was parking in pthread_mutex_lock(&kq_mtx)
+	 * / per-kqueue lock (psynch_mutexwait → dserver recvmsg). That stalled
+	 * NSApp after setDelegate and NSImage lockFocus/CGContextSaveGState.
+	 * Never block close() on those locks. */
 
 	struct kevent64_s ev[2];
 
@@ -219,46 +246,50 @@ kqueue_closed_fd(int fd)
 	ev[1].flags = EV_DELETE | EV_RECEIPT;
 	ev[1].filter = EVFILT_WRITE;
 
-	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
-	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
-	// we now have to walk through all known kqueues and remove the fd from them.
-
 	struct kqueue_close_context context;
 	context.kqs_to_check = context.kqs_to_check_buffer;
 	context.buffer_size = sizeof(context.kqs_to_check_buffer) / sizeof(*context.kqs_to_check_buffer);
 	context.kq_count = 0;
 	context.dynamic_buffer = false;
 
-	// we first have to copy all current kqueues into a buffer so we can check them with the kq_mtx dropped.
-	// this is necessary because some of the operations we perform should not be performed with the kq_mtx held.
-    // (e.g. acquiring other locks like the individual kqueue locks)
-	//
-	// FIXME: this is a terrible solution. another (possible better) solution would be to keep a map that maps FDs
-	//        to the kqueues they're in. then, each FD would hold a reference on the kqueues they're in and we can
-	//        just access those kqueues without additional locks (only the individual kqueue lock).
-
-	pthread_mutex_lock(&kq_mtx);
+	if (pthread_mutex_trylock(&kq_mtx) != 0) {
+		if (logs < 24) {
+			logs++;
+			fprintf(stderr, "kqueue_closed_fd_trylock_v1 skip global fd=%d\n", fd);
+			fflush(stderr);
+		}
+#ifdef DARLING
+		__darling_kqueue_unregister_listen(fd);
+#endif
+		return;
+	}
 	map_foreach(kqmap, kqueue_close_ref_cb, &context);
 	pthread_mutex_unlock(&kq_mtx);
 
 	for (size_t i = 0; i < context.kq_count; ++i) {
 		struct kqueue* kq = context.kqs_to_check[i];
 
-		kqueue_lock(kq);
-		// we don't care whether these operations succeed or not
+		if (tracing_mutex_trylock(&kq->kq_mtx) != 0) {
+			if (logs < 24) {
+				logs++;
+				fprintf(stderr,
+					"kqueue_closed_fd_trylock_v1 skip kq fd=%d i=%zu\n",
+					fd, i);
+				fflush(stderr);
+			}
+			continue;
+		}
 		kevent_copyin_one(kq, &ev[0]);
 		kevent_copyin_one(kq, &ev[1]);
 		kqueue_unlock(kq);
 	}
 
-	// now release the references we added
 	pthread_mutex_lock(&kq_mtx);
 	for (size_t i = 0; i < context.kq_count; ++i) {
 		kqueue_delref(context.kqs_to_check[i]);
 	}
 	pthread_mutex_unlock(&kq_mtx);
 
-	// and free the buffer (if we created one)
 	if (context.dynamic_buffer) {
 		free(context.kqs_to_check);
 	}
@@ -299,7 +330,17 @@ static void _kqueue_close_atfork_cb(int kqfd, void* kqptr, void* private)
 	struct kqueue* kq = (struct kqueue*) kqptr;
 
     // Mutexes are not valid after a fork, reset it to unlocked state
+#ifdef DARLING
+    /* code245: Darwin-like non-recursive kq_mtx. Recursive
+     * kq_mtx (code246) killed NativeWidget 992 / GPU sig=5.
+     * Unlock-around-callback is ChannelMac write_lock_ for
+     * nest=1 Ping only, not kq_mtx.
+     */
+    (void)kqueue_mtx_recursive_v1;
     tracing_mutex_init(&kq->kq_mtx, NULL);
+#else
+    tracing_mutex_init(&kq->kq_mtx, NULL);
+#endif
 
     kqueue_delref(kq);
 }
@@ -351,7 +392,12 @@ kqueue_impl(void)
         return (-1);
 
     kq->kq_ref = 1;
+#ifdef DARLING
+	(void)kqueue_mtx_recursive_v1;
 	tracing_mutex_init(&kq->kq_mtx, NULL);
+#else
+	tracing_mutex_init(&kq->kq_mtx, NULL);
+#endif
     LIST_INIT(&kq->kq_tofree);
 
     if (kqops.kqueue_init(kq) < 0) {

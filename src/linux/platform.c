@@ -21,6 +21,7 @@
 
 #ifdef DARLING
 #include "../darling/listenregistry.h"
+#include <mach/message.h>
 #endif
 
 /*
@@ -213,7 +214,7 @@ linux_kevent_wait(
 
 int
 linux_kevent_copyout(struct kqueue *kq, int nready,
-        struct kevent64_s *eventlist, int nevents UNUSED)
+        struct kevent64_s *eventlist, int nevents)
 {
     struct epoll_event *ev;
     struct filter *filt;
@@ -223,7 +224,9 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
 
     if (nready <= 0)
         return (0);
-    if (nready > nevents && nevents > 0)
+    if (nevents <= 0)
+        nevents = nready;
+    if (nready > nevents)
         nready = nevents;
     if (nready > MAX_KEVENT)
         nready = MAX_KEVENT;
@@ -251,6 +254,19 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
 
         if (fastpath(event->filter != EVFILT_DROP && event->filter != EVFILT_DROP_POSTPROCESS)) {
             eventlist++;
+            /*
+             * Network handshake drain: Connect+Bind sit (nmsg>=2).
+             * Emit a second MACHPORT notify in this kevent() so
+             * ChannelMac timeout-0 copyouts Bind on the same wakeup
+             * as Connect, before helper Ping. Helper-skip-1ns.
+             */
+            if ((kn->kn_flags & KNFL_MACHPORT_HS_DRAIN) != 0 &&
+                nret < nevents) {
+                kn->kn_flags &= ~KNFL_MACHPORT_HS_DRAIN;
+                *eventlist = *event;
+                eventlist++;
+                nret++;
+            }
         } else {
             dbg_puts("spurious wakeup, discarding event");
             nret--;
@@ -275,6 +291,8 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
         }
     }
 
+    if (nret > nevents)
+        nret = nevents;
     return (nret);
 }
 

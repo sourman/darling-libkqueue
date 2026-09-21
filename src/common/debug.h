@@ -129,6 +129,11 @@ typedef struct {
     (x)->mtx_status = MTX_LOCKED; \
 } while (0)
 
+# define tracing_mutex_trylock(x) ( \
+    pthread_mutex_trylock(&((x)->mtx_lock)) == 0 \
+        ? ((x)->mtx_owner = THREAD_ID, (x)->mtx_status = MTX_LOCKED, 0) \
+        : -1)
+
 # define tracing_mutex_unlock(x)  do { \
     (x)->mtx_status = MTX_UNLOCKED; \
     (x)->mtx_owner = -1; \
@@ -150,6 +155,7 @@ typedef struct {
 # define tracing_mutex_destroy      pthread_mutex_destroy
 # define tracing_mutex_assert(x,y)  do {} while (0)
 # define tracing_mutex_lock         pthread_mutex_lock
+# define tracing_mutex_trylock      pthread_mutex_trylock
 # define tracing_mutex_unlock       pthread_mutex_unlock
 #endif 
 

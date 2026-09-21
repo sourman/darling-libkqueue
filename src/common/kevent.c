@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "private.h"
 
@@ -123,8 +124,8 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
     int rv = 0;
 
     if (src->filter == EVFILT_MACHPORT) {
-        fprintf(stderr, "kevent MACHPORT ident=%llu flags=0x%x fflags=0x%x\n",
-            (unsigned long long)src->ident, src->flags, src->fflags);
+        fprintf(stderr, "kevent MACHPORT pid=%d ident=%llu flags=0x%x fflags=0x%x\n",
+            (int)getpid(), (unsigned long long)src->ident, src->flags, src->fflags);
         fflush(stderr);
     }
 
