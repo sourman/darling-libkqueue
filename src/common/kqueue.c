@@ -244,7 +244,14 @@ kqueue_closed_fd(int fd)
 	for (size_t i = 0; i < context.kq_count; ++i) {
 		struct kqueue* kq = context.kqs_to_check[i];
 
-		kqueue_lock(kq);
+		/*
+		 * close() calls us for every fd. If the kqueue lock is already
+		 * held (a waiter whose owner thread is gone, or kevent still
+		 * in the kernel), pthread_mutex_lock never returns and startup
+		 * never reaches the window. Skip this kqueue instead.
+		 */
+		if (pthread_mutex_trylock(&kq->kq_mtx) != 0)
+			continue;
 		// we don't care whether these operations succeed or not
 		kevent_copyin_one(kq, &ev[0]);
 		kevent_copyin_one(kq, &ev[1]);
