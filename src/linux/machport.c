@@ -70,8 +70,18 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 		return -1;
 	}
 
-	// now, read the reply
+	/*
+	 * darlingserver fills this reply by impersonating this thread.
+	 * kevent64_impl holds kq_mtx across copyout. Leaving that mutex
+	 * locked while recv waits for the reply parks every other kevent
+	 * caller (NSWindow setFrame's DidMove path) and the impersonated
+	 * fill never runs, so the reply never arrives. Drop it for the
+	 * recv only. The kqueue itself stays referenced by kevent64_impl.
+	 */
+	struct kqueue *kq = src->kn_kq;
+	kqueue_unlock(kq);
 	rv = recv(src->kdata.kn_dupfd, &reply, sizeof(reply), 0);
+	kqueue_lock(kq);
 	if (rv < 0) {
 		dbg_printf("evfilt_machport_copyout() reading reply failed: %d (%s)", errno, strerror(errno));
 		return -1;
